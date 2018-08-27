@@ -11,7 +11,7 @@ struct Document
     fvec::Array
     bvec::Array
 end
-
+#=
 #This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
 module WordVec
 
@@ -44,7 +44,7 @@ end
 
 using WordVec
 wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
-
+=#
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
     gates = weight * vcat(input, hidden) .+ bias
@@ -183,9 +183,10 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind, df; lval=[], pdrop=(0.0, 0.0))
 
-    scores = mlp1(mlpmodel, df[ind,4])
+    df[ind,4] = feats(df[ind,2],model[2])
+    scores = mlp1(model[1], df[ind,4])
     #logprobs = logp(scores)
     cval = nll(scores,[df[ind,3]])
     #goldind = df[ind,3]
@@ -197,24 +198,25 @@ end
 
 oraclegrad = grad(oracleloss)
 
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
+function oracletrain(model, df, opts, batchsize, lval=[]; pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
-        update!(mlpmodel, ograds, opts)
+        ograds = oraclegrad(model, ind, df, lval=lval, pdrop=pdrop)
+        update!(model, ograds, opts)
     end
     avgloss = mean(lval)
     return avgloss
 end
 
 # Balanced Accuracy
-function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
+function oracleacc(model, df; pdrop=(0.0, 0.0))
     ntp = 0 #number of true positives
     ntn = 0 #number of true negatives
     npos = 0 #positives
     nneg = 0 #negatives
     for ind in 1:size(df,1)
-        scores = Array(mlp1(mlpmodel, df[ind,4]))
+        df[ind,4] = feats(df[ind,2],model[2])
+        scores = Array(mlp1(model[1], df[ind,4]))
         (val1,pred) = findmax(scores)
         if df[ind,3] == 1
             nneg += 1
@@ -246,17 +248,22 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
 end
 =#
 
-function feats(df)
-    for i in 1:size(df,1)
-        doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
-        for j in 1:length(doc.word)
-            # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
-        end
-        df[i,4] = total
+function feats(doc,wordmodel)
+
+    weight = wordmodel[1]
+    bias = wordmodel[2]
+    ftype = typeof(doc.fvec[1])
+
+    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 1000x1
+
+    for j in 1:length(doc.word)
+
+        (hidden, cell) = old_lstm(weight, bias, hidden, cell, (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j])))
+        #total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
     end
-    return df
+
+    return hidden
+
 end
 
 function createdf(data; gpufeats=false)
@@ -281,12 +288,18 @@ end
 
 function main!(df;epochs=30,gpufeats=false)
 
-    inputdim = 1000
+    inputdim = 350
     hiddens = [2048]
     classnumber = 2
 
-    mlpmodel = initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats)
-    opts = oparams(mlpmodel, Adam; gclip=5.0)
+    model = Any[]
+    push!(model,initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats))
+    wordmodel = Any[]
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1350)) : Array{Float32}(xavier(1400,1350))))
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1))))
+    push!(model,wordmodel)
+    wordmodel = nothing
+    opts = oparams(model, Adam; gclip=5.0)
 
     #print(size(mlpmodel,1))
 
@@ -303,9 +316,9 @@ function main!(df;epochs=30,gpufeats=false)
 
     for i in 1:epochs
         lval = []
-        lss = oracletrain(mlpmodel, train_df, opts, lval; pdrop=(0.5, 0.8))
-        trnacc = oracleacc(mlpmodel, train_df; pdrop=(0.0, 0.0))
-        acc1 = oracleacc(mlpmodel, dev_df; pdrop=(0.0, 0.0))
+        lss = oracletrain(model, train_df, opts, lval; pdrop=(0.5, 0.8))
+        trnacc = oracleacc(model, train_df; pdrop=(0.0, 0.0))
+        acc1 = oracleacc(model, dev_df; pdrop=(0.0, 0.0))
         #=
         if savemode
             JLD.save("pos_experiment.jld", "model", model, "optims", opts)
@@ -316,9 +329,9 @@ function main!(df;epochs=30,gpufeats=false)
         println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
 	flush(STDOUT)
     end
-    JLD.save("experiment2.jld", "model", mlpmodel, "optims", opts)
+    JLD.save("experiment_lstm_last_hidden1.jld", "model", model, "optims", opts)
     #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(mlpmodel, test_df)
+    acc2 = oracleacc(model, test_df)
     println("test acc $acc2")
 
 end

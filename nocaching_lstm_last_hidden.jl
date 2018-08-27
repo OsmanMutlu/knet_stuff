@@ -3,7 +3,7 @@ using DataValues
 using Knet, JLD
 using TextAnalysis
 
-data = readxlsheet("20180502_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
+#data = readxlsheet("20180502_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
 
 struct Document
     word::Array
@@ -12,6 +12,7 @@ struct Document
     bvec::Array
 end
 
+#=
 #This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
 module WordVec
 
@@ -45,6 +46,8 @@ end
 using WordVec
 wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
 
+=#
+
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
     gates = weight * vcat(input, hidden) .+ bias
@@ -67,14 +70,15 @@ end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 #Changed it a little
-function wordlstm(fmodel, bmodel, doc::Document)
+function wordlstm(fmodel, bmodel, doc; gpufeats=false)
     # gpu-cpu conversion
-    ftype = typeof(fmodel[1])
+#    ftype = typeof(fmodel[1])
 
     # forward lstm
     fvecs = Array{Any}(length(doc.word))
     wforw, bforw = fmodel[1], fmodel[2]
-    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 350x1
+    hidden = cell = (gpufeats ? KnetArray{Float32}(xavier(350,1)) : Array{Float32}(xavier(350,1)))
+#    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 350x1
     fvecs[1] = hidden
     for i in 1:length(doc.word)-1
         (hidden, cell) = old_lstm(wforw, bforw, hidden, cell, doc.wvec[i])
@@ -84,7 +88,8 @@ function wordlstm(fmodel, bmodel, doc::Document)
     # backward lstm
     bvecs = Array{Any}(length(doc.word))
     wback, bback = bmodel[1], bmodel[2]
-    hidden = cell = ftype(Array{Float32}(xavier(350,1)))
+    hidden = cell = (gpufeats ? KnetArray{Float32}(xavier(350,1)) : Array{Float32}(xavier(350,1)))
+#    hidden = cell = ftype(Array{Float32}(xavier(350,1)))
     bvecs[end] = hidden
     for i in length(doc.word):-1:2
         (hidden, cell) = old_lstm(wback, bback, hidden, cell, doc.wvec[i])
@@ -96,23 +101,22 @@ end
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 #Changed it a little
 
-function fillallvecs!(corpus; gpufeats=false)
-    fmodel = Array{Any}(2)
-    bmodel = Array{Any}(2)
+function fillallvecs!(doc, fbmodel; gpufeats=false)
+    fmodel = fbmodel[1]
+    bmodel = fbmodel[2]
     #Maybe pretrained later
-    fmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
-    fmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
-    bmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
-    bmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
-    println("Getting word embeddings and Generating context...")
-    for doc in corpus
-        #Create context here
-        fvecs, bvecs = wordlstm(fmodel, bmodel, doc)
-        f = (gpufeats ? KnetArray{Float32} : Array{Float32})
-        map(i->push!(doc.fvec, f(i)), fvecs)
-        map(i->push!(doc.bvec, f(i)), bvecs)
-    end
-    return corpus
+#    fmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
+#    fmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
+#    bmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
+#    bmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
+#    println("Getting word embeddings and Generating context...")
+    #Create context here
+    fvecs, bvecs = wordlstm(fmodel, bmodel, doc, gpufeats=gpufeats)
+    #f = (gpufeats ? KnetArray{Float32} : Array{Float32})
+    map(i->push!(doc.fvec, i), fvecs)
+    map(i->push!(doc.bvec, i), bvecs)
+
+    return doc
 end
 
 function createcorpus1(data;gpufeats=false)
@@ -136,7 +140,7 @@ function createcorpus1(data;gpufeats=false)
         else
             data[i,4] = 2
         end
-        df = vcat(df,Array([data[i,2] Document(words,embeds,[],[]) data[i,4] 0]))
+        df = vcat(df,Array([Document(words,embeds,[],[]) data[i,4] 0]))
     end
 
     return df
@@ -183,11 +187,13 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind, df; lval=[], pdrop=(0.0, 0.0))
 
-    scores = mlp1(mlpmodel, df[ind,4])
+    fillallvecs!(df[ind,1], model[3], gpufeats=true)
+    df[ind,3] = feats(df[ind,1],model[2])
+    scores = mlp1(model[1], df[ind,3])
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[df[ind,2]])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -197,26 +203,28 @@ end
 
 oraclegrad = grad(oracleloss)
 
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
+function oracletrain(model, df, opts, batchsize, lval=[]; pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
-        update!(mlpmodel, ograds, opts)
+        ograds = oraclegrad(model, ind, df, lval=lval, pdrop=pdrop)
+        update!(model, ograds, opts)
     end
     avgloss = mean(lval)
     return avgloss
 end
 
 # Balanced Accuracy
-function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
+function oracleacc(model, df; pdrop=(0.0, 0.0))
     ntp = 0 #number of true positives
     ntn = 0 #number of true negatives
     npos = 0 #positives
     nneg = 0 #negatives
     for ind in 1:size(df,1)
-        scores = Array(mlp1(mlpmodel, df[ind,4]))
+        fillallvecs!(df[ind,1], model[3], gpufeats=true)
+        df[ind,3] = feats(df[ind,1],model[2])
+        scores = Array(mlp1(model[1], df[ind,3]))
         (val1,pred) = findmax(scores)
-        if df[ind,3] == 1
+        if df[ind,2] == 1
             nneg += 1
             if pred == 1
                 ntn += 1
@@ -246,17 +254,22 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
 end
 =#
 
-function feats(df)
-    for i in 1:size(df,1)
-        doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
-        for j in 1:length(doc.word)
-            # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
-        end
-        df[i,4] = total
+function feats(doc,wordmodel)
+
+    weight = wordmodel[1]
+    bias = wordmodel[2]
+    ftype = typeof(doc.fvec[1])
+
+    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 1000x1
+
+    for j in 1:length(doc.word)
+
+        (hidden, cell) = old_lstm(weight, bias, hidden, cell, (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j])))
+        #total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
     end
-    return df
+
+    return hidden
+
 end
 
 function createdf(data; gpufeats=false)
@@ -265,11 +278,11 @@ function createdf(data; gpufeats=false)
     wvec1 = nothing
 
 
-    df[:,2] = fillallvecs!(df[:,2],gpufeats=gpufeats)
-    println("Done generating.")
+#    df[:,2] = fillallvecs!(df[:,2],gpufeats=gpufeats)
+#    println("Done generating.")
 
-    df = feats(df)
-    println("Generated feats.")
+#    df = feats(df)
+#    println("Generated feats.")
 
     #corpus = nothing
     #df[:,2] = nothing
@@ -281,12 +294,32 @@ end
 
 function main!(df;epochs=30,gpufeats=false)
 
-    inputdim = 1000
+    inputdim = 350
     hiddens = [2048]
     classnumber = 2
 
-    mlpmodel = initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats)
-    opts = oparams(mlpmodel, Adam; gclip=5.0)
+    model = Any[]
+    push!(model,initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats))
+    wordmodel = Any[]
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1350)) : Array{Float32}(xavier(1400,1350))))
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1))))
+    push!(model,wordmodel)
+    fbmodel = Any[]
+    fmodel = Any[]
+    bmodel = Any[]
+    push!(fmodel, (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650))))
+    push!(fmodel, (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1))))
+    push!(bmodel, (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650))))
+    push!(bmodel, (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1))))
+    push!(fbmodel, fmodel)
+    push!(fbmodel, bmodel)
+    push!(model, fbmodel)
+    fbmodel = nothing
+    fmodel = nothing
+    bmodel = nothing
+    wordmodel = nothing
+    knetgc()
+    opts = oparams(model, Adam; gclip=5.0)
 
     #print(size(mlpmodel,1))
 
@@ -303,9 +336,9 @@ function main!(df;epochs=30,gpufeats=false)
 
     for i in 1:epochs
         lval = []
-        lss = oracletrain(mlpmodel, train_df, opts, lval; pdrop=(0.5, 0.8))
-        trnacc = oracleacc(mlpmodel, train_df; pdrop=(0.0, 0.0))
-        acc1 = oracleacc(mlpmodel, dev_df; pdrop=(0.0, 0.0))
+        lss = oracletrain(model, train_df, opts, lval; pdrop=(0.5, 0.8))
+        trnacc = oracleacc(model, train_df; pdrop=(0.0, 0.0))
+        acc1 = oracleacc(model, dev_df; pdrop=(0.0, 0.0))
         #=
         if savemode
             JLD.save("pos_experiment.jld", "model", model, "optims", opts)
@@ -316,22 +349,22 @@ function main!(df;epochs=30,gpufeats=false)
         println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
 	flush(STDOUT)
     end
-    JLD.save("experiment2.jld", "model", mlpmodel, "optims", opts)
+    JLD.save("experiment_lstm_last_hidden1.jld", "model", model, "optims", opts)
     #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(mlpmodel, test_df)
+    acc2 = oracleacc(model, test_df)
     println("test acc $acc2")
 
 end
 
-#=
-alldf = createdf(data,gpufeats=true)
-println("Saving data...")
-save("timesofindia_with_column2.jld", "data", alldf)
-=#
 
+#alldf = createdf(data,gpufeats=true)
+#println("Saving data...")
+#save("timesofindia_without_pretrain.jld", "data", alldf)
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("timesofindia_with_column2.jld")["data"]
+alldf = load("timesofindia_without_pretrain.jld")["data"]
 
 main!(alldf,epochs=30,gpufeats=true)
+
+#look at fillallvecs, map function

@@ -3,7 +3,7 @@ using DataValues
 using Knet, JLD
 using TextAnalysis
 
-data = readxlsheet("20180502_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
+data = readxlsheet("20180613_theIndianExpress_AgreedByAll.xlsx", "Sheet1")
 
 struct Document
     word::Array
@@ -148,7 +148,7 @@ oparams{T<:Number}(::Array{T},otype; o...)=otype(;o...)
 oparams(a::Associative,otype; o...)=Dict(k=>oparams(v,otype;o...) for (k,v) in a)
 oparams(a,otype; o...)=map(x->oparams(x,otype;o...), a)
 
-# xavier init taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
+# xavier initialization taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
 function initx(d...; ftype=Float32, gpufeats=false)
     if gpufeats
         KnetArray{ftype}(xavier(d...))
@@ -158,7 +158,7 @@ function initx(d...; ftype=Float32, gpufeats=false)
 end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-#Changed it a little
+#changed it a little
 function initmodel(inputdim,hiddens,classnumber;gpufeats=false)
     # initialize MLP
     mlpmodel = Any[]
@@ -208,13 +208,14 @@ function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
 end
 
 # Balanced Accuracy
-function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
+function oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
     ntp = 0 #number of true positives
     ntn = 0 #number of true negatives
     npos = 0 #positives
     nneg = 0 #negatives
     for ind in 1:size(df,1)
-        scores = Array(mlp1(mlpmodel, df[ind,4]))
+        df[ind,4] = feats(vocab,model[2],df[ind,2])
+        scores = Array(mlp1(model[1], df[ind,4]))
         (val1,pred) = findmax(scores)
         if df[ind,3] == 1
             nneg += 1
@@ -246,17 +247,40 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
 end
 =#
 
-function feats(df)
+#=
+function feats(vocab, df, wordmodel)
     for i in 1:size(df,1)
         doc = df[i,2]
         total = fill!(similar(doc.fvec[1], 1000, 1),0)
         for j in 1:length(doc.word)
+            w = vocab[doc.word[j]]
+            if !(w in keys(vocab))
+                vocab[w] = Array{Float32}(xavier(1))[1]
+            end
             # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
+            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* vocab[w])
         end
         df[i,4] = total
     end
     return df
+end
+=#
+
+function feats(vocab,wordmodel,doc;training=false)
+
+    total = fill!(similar(doc.fvec[1], 1000, 1),0)
+    for j in 1:length(doc.word)
+        # This is the input that mlp is going to get
+        w = doc.word[j]
+        if vocab[w]
+            wweight = wordmodel[vocab[w]]
+        else
+            #wweight = wordmodel[1]
+            wweight = 1/length(doc.word)
+        end
+        total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* wweight)
+    end
+    return total
 end
 
 function createdf(data; gpufeats=false)
@@ -279,59 +303,31 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df;epochs=30,gpufeats=false)
+function main!(df,vocab)
 
-    inputdim = 1000
-    hiddens = [2048]
-    classnumber = 2
+    asd = load("experiment_with_vocab1.jld")
+    model = asd["model"]
+    opts = asd["optims"]
 
-    mlpmodel = initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats)
-    opts = oparams(mlpmodel, Adam; gclip=5.0)
+#    df = feats(vocab, df, model[2])
+#    println("Generated feats")
+#    flush(STDOUT)
 
-    #print(size(mlpmodel,1))
-
-    #Seperate corpus and dev
-    df = df[shuffle(1:end), :]
-    test_df = df[end-199:end,:]
-    sep = size(df,1) - round(Int,size(df,1)/5 - 200)
-    train_df = df[1:sep,:]
-    dev_df = df[sep+1:end-200,:]
-
-    println("Train-dev seperated.")
-    println("Start Training...")
+    acc1 = oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
+    println("Indianexpress test acc $acc1 ...")
     flush(STDOUT)
-
-    for i in 1:epochs
-        lval = []
-        lss = oracletrain(mlpmodel, train_df, opts, lval; pdrop=(0.5, 0.8))
-        trnacc = oracleacc(mlpmodel, train_df; pdrop=(0.0, 0.0))
-        acc1 = oracleacc(mlpmodel, dev_df; pdrop=(0.0, 0.0))
-        #=
-        if savemode
-            JLD.save("pos_experiment.jld", "model", model, "optims", opts)
-            println("Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-            i==5 && break
-        end
-        =#
-        println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
-	flush(STDOUT)
-    end
-    JLD.save("experiment2.jld", "model", mlpmodel, "optims", opts)
-    #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(mlpmodel, test_df)
-    println("test acc $acc2")
 
 end
 
 #=
 alldf = createdf(data,gpufeats=true)
 println("Saving data...")
-save("timesofindia_with_column2.jld", "data", alldf)
+save("indianexpress_with_column2.jld", "data", alldf)
 =#
-
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("timesofindia_with_column2.jld")["data"]
+alldf = load("indianexpress_with_column2.jld")["data"]
+vocab = load("vocab3.jld")["vocab"]
 
-main!(alldf,epochs=30,gpufeats=true)
+main!(alldf,vocab)

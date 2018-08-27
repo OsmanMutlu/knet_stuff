@@ -281,7 +281,7 @@ end
 
 function main!(df)
 
-    asd = load("experiment1.jld")
+    asd = load("experiment2.jld")
     mlpmodel = asd["model"]
     opts = asd["optims"]
 
@@ -301,4 +301,3 @@ println("Loading data...")
 flush(STDOUT)
 alldf = load("indianexpress_with_column2.jld")["data"]
 main!(alldf)
-
