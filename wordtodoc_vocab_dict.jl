@@ -14,6 +14,7 @@ struct Document
     bvec::Array
 end
 
+#=
 #This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
 module WordVec
 
@@ -46,6 +47,7 @@ end
 
 using WordVec
 wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
+=#
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
@@ -185,12 +187,12 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(model, ind, df, vocab; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind2, ind3, vocab; lval=[], pdrop=(0.0, 0.0))
 
-    df[ind,4] = feats(vocab,model[2],df[ind,2];training=true)
-    scores = mlp1(model[1], df[ind,4])
+    total = feats(vocab,model[2],ind2;training=true)
+    scores = mlp1(model[1], total)
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[ind3])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -206,7 +208,7 @@ function oracletrain(model, df, vocab, opts;lval=[], pdrop=nothing)
 #        println("I'm here")
 #        flush(STDOUT)
 #        df[ind,4], model[2], words = feats(vocab,df[ind,2];training=true)
-        ograds = oraclegrad(model, ind, df, vocab; lval=lval, pdrop=pdrop)
+        ograds = oraclegrad(model, df[ind,2], df[ind,3], vocab; lval=lval, pdrop=pdrop)
         update!(model, ograds, opts)
 #=
         for i in 1:length(words)
@@ -274,7 +276,7 @@ function createvocab(df,wordsize)
     end
 
     sorted_vocab = sort(collect(zip(values(vocab),keys(vocab))))
-    sorted_vocab = sorted_vocab[1:wordsize-1]
+#    sorted_vocab = sorted_vocab[1:wordsize-1]
     vocab2["unk"] = 1
     ind = 2
     for w in sorted_vocab
@@ -286,7 +288,7 @@ end
 
 function feats(vocab,wordmodel,doc;training=false)
 
-    total = fill!(similar(doc.fvec[1], 1000, 1),0)
+    total = fill!(similar(KnetArray{Float32}(doc.wvec[1]), 300, 1),0)
     for j in 1:length(doc.word)
         # This is the input that mlp is going to get
         w = doc.word[j]
@@ -296,7 +298,7 @@ function feats(vocab,wordmodel,doc;training=false)
             #wweight = wordmodel[1]
             wweight = 1/length(doc.word)
         end
-        total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* wweight)
+        total = total .+ KnetArray{Float32}(doc.wvec[j]) .* wweight
     end
     return total
 end
@@ -321,9 +323,9 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df,vocab,wordsize;epochs=30,gpufeats=false)
+function main!(train_df,dev_df,vocab,wordsize;epochs=30,gpufeats=false)
 
-    inputdim = 1000
+    inputdim = 300
     hiddens = [2048]
     classnumber = 2
 
@@ -336,52 +338,69 @@ function main!(df,vocab,wordsize;epochs=30,gpufeats=false)
     push!(model, (gpufeats ? KnetArray{Float32}(xavier(wordsize)) : Array{Float32}(xavier(wordsize))))
     opts = oparams(model, Adam; gclip=5.0)
 
+#=
     #Seperate corpus and dev
     df = df[shuffle(1:end), :]
     test_df = df[end-199:end,:]
     sep = size(df,1) - round(Int,size(df,1)/5 - 200)
     train_df = df[1:sep,:]
     dev_df = df[sep+1:end-200,:]
+=#
 
-    println("Train-dev seperated.")
     println("Start Training...")
     flush(STDOUT)
 
+    best_acc = 0.0
+    acc1 = 0.0
     for i in 1:epochs
         lval = []
         lss = oracletrain(model, train_df, vocab, opts;lval=lval, pdrop=(0.5, 0.8))
         trnacc = oracleacc(model, train_df, vocab; pdrop=(0.0, 0.0))
         acc1 = oracleacc(model, dev_df, vocab; pdrop=(0.0, 0.0))
-        #=
-        if savemode
-            JLD.save("pos_experiment.jld", "model", model, "optims", opts)
-            println("Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-            i==5 && break
+
+        if acc1 > best_acc
+            JLD.save("experiment_with_vocab_best_model_only_word_embeds.jld", "model", model, "optims", opts)
+            best_acc = acc1
+            println("Now best model")
         end
-        =#
+
         println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
 	flush(STDOUT)
     end
-    JLD.save("experiment_with_vocab1.jld", "model", model, "optims", opts)
+    JLD.save("experiment_with_vocab_only_word_embeds.jld", "model", model, "optims", opts)
     #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(model, test_df, vocab)
-    println("test acc $acc2")
 
+    test_df = load("testData_20180901_only_word_embeds.jld")["data"]
+
+    if acc1 < best_acc
+        asd = load("experiment_with_vocab_best_model_only_word_embeds.jld")
+        model = asd["model"]
+        opts = asd["optims"]
+        acc2 = oracleacc(model, test_df, vocab)
+    else
+        acc2 = oracleacc(model, test_df, vocab)
+    end
+
+    println("test acc $acc2")
 end
 
 #=
 alldf = createdf(data,gpufeats=true)
 println("Saving data...")
-save("timesofindia_with_column2.jld", "data", alldf)
+save("timesofindia_with_column2_3.jld", "data", alldf)
 =#
 
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("timesofindia_with_column2.jld")["data"]
-wordsize = 10000
-#vocab = createvocab(alldf,wordsize)
-#JLD.save("vocab3.jld", "vocab", vocab)
-vocab = load("vocab3.jld")["vocab"]
+train_df = load("trainData_20180901_only_word_embeds.jld")["data"]
+dev_df = load("devData_20180901_only_word_embeds.jld")["data"]
+#wordsize = 43426
+wordsize = 44151
+#vocab = createvocab(train_df,wordsize)
+#JLD.save("vocab_latest.jld", "vocab", vocab)
+vocab = load("vocab_latest.jld")["vocab"]
 
-main!(alldf,vocab,wordsize,epochs=30,gpufeats=false)
+Knet.setseed(42)
+
+main!(train_df,dev_df,vocab,wordsize,epochs=30,gpufeats=true)

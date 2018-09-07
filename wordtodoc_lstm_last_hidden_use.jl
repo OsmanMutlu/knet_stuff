@@ -11,7 +11,7 @@ struct Document
     fvec::Array
     bvec::Array
 end
-
+#=
 #This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
 module WordVec
 
@@ -44,7 +44,7 @@ end
 
 using WordVec
 wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
-
+=#
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
     gates = weight * vcat(input, hidden) .+ bias
@@ -148,7 +148,7 @@ oparams{T<:Number}(::Array{T},otype; o...)=otype(;o...)
 oparams(a::Associative,otype; o...)=Dict(k=>oparams(v,otype;o...) for (k,v) in a)
 oparams(a,otype; o...)=map(x->oparams(x,otype;o...), a)
 
-# xavier initialization taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
+# xavier init taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
 function initx(d...; ftype=Float32, gpufeats=false)
     if gpufeats
         KnetArray{ftype}(xavier(d...))
@@ -158,7 +158,7 @@ function initx(d...; ftype=Float32, gpufeats=false)
 end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-#changed it a little
+#Changed it a little
 function initmodel(inputdim,hiddens,classnumber;gpufeats=false)
     # initialize MLP
     mlpmodel = Any[]
@@ -183,11 +183,12 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind2, ind3; lval=[], pdrop=(0.0, 0.0))
 
-    scores = mlp1(mlpmodel, df[ind,4])
+    total = feats(ind2,model[2])
+    scores = mlp1(model[1], total)
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[ind3])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -197,24 +198,24 @@ end
 
 oraclegrad = grad(oracleloss)
 
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
+function oracletrain(model, df, opts, batchsize, lval=[]; pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
-        update!(mlpmodel, ograds, opts)
+        ograds = oraclegrad(model, df[ind,2], df[ind,3], lval=lval, pdrop=pdrop)
+        update!(model, ograds, opts)
     end
     avgloss = mean(lval)
     return avgloss
 end
 
 # Balanced Accuracy
-function oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
+function oracleacc(model, df; pdrop=(0.0, 0.0))
     ntp = 0 #number of true positives
     ntn = 0 #number of true negatives
     npos = 0 #positives
     nneg = 0 #negatives
     for ind in 1:size(df,1)
-        df[ind,4] = feats(vocab,model[2],df[ind,2])
+        df[ind,4] = feats(df[ind,2],model[2])
         scores = Array(mlp1(model[1], df[ind,4]))
         (val1,pred) = findmax(scores)
         if df[ind,3] == 1
@@ -247,40 +248,21 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
 end
 =#
 
-#=
-function feats(vocab, df, wordmodel)
-    for i in 1:size(df,1)
-        doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
-        for j in 1:length(doc.word)
-            w = vocab[doc.word[j]]
-            if !(w in keys(vocab))
-                vocab[w] = Array{Float32}(xavier(1))[1]
-            end
-            # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* vocab[w])
-        end
-        df[i,4] = total
-    end
-    return df
-end
-=#
+function feats(doc,wordmodel)
 
-function feats(vocab,wordmodel,doc;training=false)
+    weight = wordmodel[1]
+    bias = wordmodel[2]
 
-    total = fill!(similar(KnetArray{Float32}(doc.wvec[1]), 950, 1),0)
+    hidden = cell = KnetArray{Float32}(xavier(950,1)) # Hiddens are 1000x1
+
     for j in 1:length(doc.word)
-        # This is the input that mlp is going to get
-        w = doc.word[j]
-        if w in keys(vocab)
-            wweight = wordmodel[vocab[w]]
-        else
-            #wweight = wordmodel[1]
-            wweight = 1/length(doc.word)
-        end
-        total = total .+ KnetArray{Float32}(doc.wvec[j]) .* wweight
+
+        (hidden, cell) = old_lstm(weight, bias, hidden, cell, KnetArray{Float32}(doc.wvec[j]))
+        #total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
     end
-    return total
+
+    return hidden
+
 end
 
 function createdf(data; gpufeats=false)
@@ -303,17 +285,13 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df,vocab)
+function main!(df;epochs=30,gpufeats=false)
 
-    asd = load("experiment_with_vocab_best_model_with_omers_lm.jld")
+    asd = load("experiment_lstm_last_hidden_best_model_with_omers_lm.jld")
     model = asd["model"]
     opts = asd["optims"]
 
-#    df = feats(vocab, df, model[2])
-#    println("Generated feats")
-#    flush(STDOUT)
-
-    acc1 = oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
+    acc1 = oracleacc(model, df; pdrop=(0.0, 0.0))
     println("Indianexpress test acc $acc1 ...")
     flush(STDOUT)
 
@@ -322,12 +300,12 @@ end
 #=
 alldf = createdf(data,gpufeats=true)
 println("Saving data...")
-save("indianexpress_with_column2.jld", "data", alldf)
+save("timesofindia_with_column2.jld", "data", alldf)
 =#
+
 
 println("Loading data...")
 flush(STDOUT)
 alldf = load("indianexpress_with_omers_lm.jld")["data"]
-vocab = load("vocab.jld")["vocab"]
 
-main!(alldf,vocab)
+main!(alldf,epochs=30,gpufeats=true)

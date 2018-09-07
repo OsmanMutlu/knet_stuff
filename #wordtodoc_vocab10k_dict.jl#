@@ -3,7 +3,9 @@ using DataValues
 using Knet, JLD
 using TextAnalysis
 
-data = readxlsheet("20180613_theIndianExpress_AgreedByAll.xlsx", "Sheet1")
+#We create a dict that contains weights for every word in our vocab. Then we multiply words in doc with these weights and create doc vector (in the feats function)
+
+data = readxlsheet("20180502_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
 
 struct Document
     word::Array
@@ -12,6 +14,7 @@ struct Document
     bvec::Array
 end
 
+#=
 #This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
 module WordVec
 
@@ -44,6 +47,7 @@ end
 
 using WordVec
 wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
+=#
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
@@ -148,7 +152,7 @@ oparams{T<:Number}(::Array{T},otype; o...)=otype(;o...)
 oparams(a::Associative,otype; o...)=Dict(k=>oparams(v,otype;o...) for (k,v) in a)
 oparams(a,otype; o...)=map(x->oparams(x,otype;o...), a)
 
-# xavier initialization taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
+# xavier init taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
 function initx(d...; ftype=Float32, gpufeats=false)
     if gpufeats
         KnetArray{ftype}(xavier(d...))
@@ -158,7 +162,7 @@ function initx(d...; ftype=Float32, gpufeats=false)
 end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-#changed it a little
+#Changed it a little
 function initmodel(inputdim,hiddens,classnumber;gpufeats=false)
     # initialize MLP
     mlpmodel = Any[]
@@ -183,11 +187,12 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind2, ind3, vocab; lval=[], pdrop=(0.0, 0.0))
 
-    scores = mlp1(mlpmodel, df[ind,4])
+    total = feats(vocab,model[2],ind2;training=true)
+    scores = mlp1(model[1], total)
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[ind3])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -197,11 +202,19 @@ end
 
 oraclegrad = grad(oracleloss)
 
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
+function oracletrain(model, df, vocab, opts;lval=[], pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
-        update!(mlpmodel, ograds, opts)
+#        println("I'm here")
+#        flush(STDOUT)
+#        df[ind,4], model[2], words = feats(vocab,df[ind,2];training=true)
+        ograds = oraclegrad(model, df[ind,2], df[ind,3], vocab; lval=lval, pdrop=pdrop)
+        update!(model, ograds, opts)
+#=
+        for i in 1:length(words)
+            vocab[words[i]] = model[2][i]
+        end
+=#
     end
     avgloss = mean(lval)
     return avgloss
@@ -247,28 +260,35 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
 end
 =#
 
-#=
-function feats(vocab, df, wordmodel)
-    for i in 1:size(df,1)
-        doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
-        for j in 1:length(doc.word)
-            w = vocab[doc.word[j]]
-            if !(w in keys(vocab))
-                vocab[w] = Array{Float32}(xavier(1))[1]
+function createvocab(df,wordsize)
+
+    vocab = Dict{String,Any}()
+    vocab2 = Dict{String,Any}()
+    for i in 2:size(df,1)
+        for w in df[i,2].word
+            if w in keys(vocab)
+                #vocab[w] = Array{Float32}(xavier(1))[1]
+                vocab[w] += 1
+            else
+                vocab[w] = 1
             end
-            # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* vocab[w])
         end
-        df[i,4] = total
     end
-    return df
+
+    sorted_vocab = sort(collect(zip(values(vocab),keys(vocab))))
+    sorted_vocab = sorted_vocab[1:wordsize-1]
+    vocab2["unk"] = 1
+    ind = 2
+    for w in sorted_vocab
+        vocab2[w[2]] = ind
+        ind += 1
+    end
+    return vocab2
 end
-=#
 
 function feats(vocab,wordmodel,doc;training=false)
 
-    total = fill!(similar(KnetArray{Float32}(doc.wvec[1]), 950, 1),0)
+    total = fill!(similar(KnetArray{Float32}(doc.wvec[1]), 300, 1),0)
     for j in 1:length(doc.word)
         # This is the input that mlp is going to get
         w = doc.word[j]
@@ -303,31 +323,84 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df,vocab)
+function main!(train_df,dev_df,vocab,wordsize;epochs=30,gpufeats=false)
 
-    asd = load("experiment_with_vocab_best_model_with_omers_lm.jld")
-    model = asd["model"]
-    opts = asd["optims"]
+    inputdim = 300
+    hiddens = [2048]
+    classnumber = 2
 
-#    df = feats(vocab, df, model[2])
-#    println("Generated feats")
-#    flush(STDOUT)
+    #model = Array{Any}(2)
+    model = Any[]
+    mlpmodel = initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats)
+    push!(model, mlpmodel)
+    #model[1] = mlpmodel
+    #model[2] = (gpufeats ? KnetArray{Float32}(xavier(wordsize)) : Array{Float32}(xavier(wordsize)))
+    push!(model, (gpufeats ? KnetArray{Float32}(xavier(wordsize)) : Array{Float32}(xavier(wordsize))))
+    opts = oparams(model, Adam; gclip=5.0)
 
-    acc1 = oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
-    println("Indianexpress test acc $acc1 ...")
+#=
+    #Seperate corpus and dev
+    df = df[shuffle(1:end), :]
+    test_df = df[end-199:end,:]
+    sep = size(df,1) - round(Int,size(df,1)/5 - 200)
+    train_df = df[1:sep,:]
+    dev_df = df[sep+1:end-200,:]
+=#
+
+    println("Start Training...")
     flush(STDOUT)
 
+    best_acc = 0.0
+    acc1 = 0.0
+    for i in 1:epochs
+        lval = []
+        lss = oracletrain(model, train_df, vocab, opts;lval=lval, pdrop=(0.5, 0.8))
+        trnacc = oracleacc(model, train_df, vocab; pdrop=(0.0, 0.0))
+        acc1 = oracleacc(model, dev_df, vocab; pdrop=(0.0, 0.0))
+
+        if acc1 > best_acc
+            JLD.save("experiment_with_vocab10k_best_model_only_word_embeds.jld", "model", model, "optims", opts)
+            best_acc = acc1
+            println("Now best model")
+        end
+
+        println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
+	flush(STDOUT)
+    end
+    JLD.save("experiment_with_vocab10k_only_word_embeds.jld", "model", model, "optims", opts)
+    #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
+
+    test_df = load("testData_20180901_only_word_embeds.jld")["data"]
+
+    if acc1 < best_acc
+        asd = load("experiment_with_vocab10k_best_model_only_word_embeds.jld")
+        model = asd["model"]
+        opts = asd["optims"]
+        acc2 = oracleacc(model, test_df, vocab)
+    else
+        acc2 = oracleacc(model, test_df, vocab)
+    end
+
+    println("test acc $acc2")
 end
 
 #=
 alldf = createdf(data,gpufeats=true)
 println("Saving data...")
-save("indianexpress_with_column2.jld", "data", alldf)
+save("timesofindia_with_column2_3.jld", "data", alldf)
 =#
+
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("indianexpress_with_omers_lm.jld")["data"]
-vocab = load("vocab.jld")["vocab"]
+train_df = load("trainData_20180901_only_word_embeds.jld")["data"]
+dev_df = load("devData_20180901_only_word_embeds.jld")["data"]
+#wordsize = 43426
+wordsize = 10000
+#vocab = createvocab(train_df,wordsize)
+#JLD.save("vocab10k_latest.jld", "vocab", vocab)
+vocab = load("vocab10k_latest.jld")["vocab"]
 
-main!(alldf,vocab)
+Knet.setseed(42)
+
+main!(train_df,dev_df,vocab,wordsize,epochs=30,gpufeats=true)

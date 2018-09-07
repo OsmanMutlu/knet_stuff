@@ -3,143 +3,11 @@ using DataValues
 using Knet, JLD
 using TextAnalysis
 
-data = readxlsheet("20180502_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
-
-struct Document
+mutable struct Document
     word::Array
     wvec::Array
     fvec::Array
     bvec::Array
-end
-
-#This module is from https://gist.github.com/ozanarkancan/b55c992c5fa26944142c7fd8fdb2b6ff
-module WordVec
-
-using PyCall
-
-global const word2vec = PyCall.pywrap(PyCall.pyimport("gensim.models.keyedvectors"))
-
-type Wvec
-	model
-end
-
-function Wvec(fname::String; bin=true)
-	Wvec(word2vec.KeyedVectors["load_word2vec_format"](fname, binary=bin))
-end
-
-function getvec(m::Wvec, word::AbstractString)
-	vec = nothing
-	try
-		vec = m.model["__getitem__"](word)
-	catch
-		vec = m.model["__getitem__"]("unk")
-	end
-	return vec
-end
-
-export Wvec;
-export getvec;
-
-end
-
-using WordVec
-wvec1 = Wvec("../word-embedding/GoogleNews-vectors-negative300.bin")
-
-#Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
-function old_lstm(weight, bias, hidden, cell, input; mask=nothing)
-    gates = weight * vcat(input, hidden) .+ bias
-    H = size(hidden, 1)
-    forget = sigm.(gates[1:H, :])
-    ingate = sigm.(gates[1+H:2H, :])
-    outgate = sigm.(gates[1+2H:3H, :])
-    change = tanh.(gates[1+3H:4H, :])
-    (mask != nothing) && (mask = reshape(mask, 1, length(mask)))
-
-    cell = cell .* forget + ingate .* change
-    hidden = outgate .* tanh.(cell)
-
-    if mask != nothing
-        hidden = hidden .* mask
-        cell = cell .* mask
-    end
-    return (hidden, cell)
-end
-
-#Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
-#Changed it a little
-function wordlstm(fmodel, bmodel, doc::Document)
-    # gpu-cpu conversion
-    ftype = typeof(fmodel[1])
-
-    # forward lstm
-    fvecs = Array{Any}(length(doc.word))
-    wforw, bforw = fmodel[1], fmodel[2]
-    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 350x1
-    fvecs[1] = hidden
-    for i in 1:length(doc.word)-1
-        (hidden, cell) = old_lstm(wforw, bforw, hidden, cell, doc.wvec[i])
-        fvecs[i+1] = hidden
-    end
-
-    # backward lstm
-    bvecs = Array{Any}(length(doc.word))
-    wback, bback = bmodel[1], bmodel[2]
-    hidden = cell = ftype(Array{Float32}(xavier(350,1)))
-    bvecs[end] = hidden
-    for i in length(doc.word):-1:2
-        (hidden, cell) = old_lstm(wback, bback, hidden, cell, doc.wvec[i])
-        bvecs[i-1] = hidden
-    end
-    return fvecs, bvecs
-end
-
-#Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
-#Changed it a little
-
-function fillallvecs!(corpus; gpufeats=false)
-    fmodel = Array{Any}(2)
-    bmodel = Array{Any}(2)
-    #Maybe pretrained later
-    fmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
-    fmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
-    bmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
-    bmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
-    println("Getting word embeddings and Generating context...")
-    for doc in corpus
-        #Create context here
-        fvecs, bvecs = wordlstm(fmodel, bmodel, doc)
-        f = (gpufeats ? KnetArray{Float32} : Array{Float32})
-        map(i->push!(doc.fvec, f(i)), fvecs)
-        map(i->push!(doc.bvec, f(i)), bvecs)
-    end
-    return corpus
-end
-
-function createcorpus1(data;gpufeats=false)
-    ftype = (gpufeats ? KnetArray{Float32} : Array{Float32})
-    df = []
-    for i in 2:size(data,1)
-        typeof(data[i,4]) != typeof(1.0) && continue # Only deal with rows that have a label
-        sd = StringDocument(data[i,3])
-        remove_corrupt_utf8!(sd)
-        remove_punctuation!(sd)
-        words = convert(Array{String}, TextAnalysis.tokens(sd))
-        words = words[1:end-5]
-        embeds = []
-        for w in words
-            push!(embeds, ftype(getvec(wvec1, w)))
-        end
-        #doc = WordTokenizers.split_sentences(data[i,3])
-        #doc2 = []
-        if data[i,4] == 0.0
-            data[i,4] = 1
-        else
-            data[i,4] = 2
-        end
-        df = vcat(df,Array([data[i,2] Document(words,embeds,[],[]) data[i,4] 0]))
-    end
-
-    return df
 end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
@@ -173,21 +41,21 @@ function initmodel(inputdim,hiddens,classnumber;gpufeats=false)
 end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-function mlp1(w, input)
-    #x = dropout(input, pdrop[1])
+function mlp1(w, input; pdrop=(0.0, 0.0))
+#    input = dropout(input, pdrop[1])
     for i in 1:2:length(w)-2
         input = relu.(w[i] * input .+ w[i+1]) # To test in linear models
         #x = w[i] * x .+ w[i+1]
-        #x = dropout(x, pdrop[2])
+#        input = dropout(input, pdrop[2])
     end
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(mlpmodel, ind3, ind4; lval=[], pdrop=(0.0, 0.0))
 
-    scores = mlp1(mlpmodel, df[ind,4])
+    scores = mlp1(mlpmodel, ind4, pdrop=pdrop)
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[ind3])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -197,20 +65,23 @@ end
 
 oraclegrad = grad(oracleloss)
 
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
+function oracletrain(mlpmodel, df, opts; pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
+        ograds = oraclegrad(mlpmodel, df[ind,3], df[ind,4], lval=lval, pdrop=pdrop)
         update!(mlpmodel, ograds, opts)
     end
     avgloss = mean(lval)
     return avgloss
 end
 
+#=
 # Balanced Accuracy
 function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
     ntp = 0 #number of true positives
     ntn = 0 #number of true negatives
+    nfp = 0 #number of false positives
+    nfn = 0 #number of false negatives
     npos = 0 #positives
     nneg = 0 #negatives
     for ind in 1:size(df,1)
@@ -220,15 +91,64 @@ function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
             nneg += 1
             if pred == 1
                 ntn += 1
+            else
+                nfp += 1
             end
         else
             npos += 1
             if pred == 2
                 ntp += 1
+            else
+                nfn += 1
             end
         end
     end
+
     return ((ntp / npos) + (ntn / nneg)) / 2
+end
+=#
+
+#if test f1 else balanced accuracy
+function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0), test=false)
+    ntp = 0 #number of true positives
+    ntn = 0 #number of true negatives
+    nfp = 0 #number of false positives
+    nfn = 0 #number of false negatives
+    npos = 0 #positives
+    nneg = 0 #negatives
+    for ind in 1:size(df,1)
+        scores = Array(mlp1(mlpmodel, df[ind,4]))
+        (val1,pred) = findmax(scores)
+        if df[ind,3] == 1
+            nneg += 1
+            if pred == 1
+                ntn += 1
+            else
+                nfp += 1
+            end
+        else
+            npos += 1
+            if pred == 2
+                ntp += 1
+            else
+                nfn += 1
+            end
+        end
+    end
+
+    acc2 = ((ntp / npos) + (ntn / nneg)) / 2
+
+    if test
+        precision_2 = ntp / (ntp + nfp)
+        precision_1 = ntn / (ntn + nfn)
+        recall_2 = ntp / (ntp + nfn)
+        recall_1 = ntn / (ntn + nfp)
+        f1_1 = (2 * precision_1 * recall_1) / (precision_1 + recall_1)
+        f1_2 = (2 * precision_2 * recall_2) / (precision_2 + recall_2)
+        return acc2, f1_1, f1_2
+    end
+
+    return acc2
 end
 
 # Normal Accuracy
@@ -249,89 +169,71 @@ end
 function feats(df)
     for i in 1:size(df,1)
         doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
+        total = fill!(KnetArray{Float32}(300,1),0)
         for j in 1:length(doc.word)
             # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
+            total = total .+ KnetArray{Float32}(doc.wvec[j] .* (1/length(doc.word)))
         end
         df[i,4] = total
     end
     return df
 end
 
-function createdf(data; gpufeats=false)
-    df = createcorpus1(data,gpufeats=gpufeats)
-    data = nothing
-    wvec1 = nothing
+function main!(train_df,dev_df;epochs=30,gpufeats=false)
 
-
-    df[:,2] = fillallvecs!(df[:,2],gpufeats=gpufeats)
-    println("Done generating.")
-
-    df = feats(df)
-    println("Generated feats.")
-
-    #corpus = nothing
-    #df[:,2] = nothing
-    knetgc()
-    #return df
-    return df
-
-end
-
-function main!(df;epochs=30,gpufeats=false)
-
-    inputdim = 1000
+    inputdim = 300
     hiddens = [2048]
     classnumber = 2
 
     mlpmodel = initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats)
     opts = oparams(mlpmodel, Adam; gclip=5.0)
 
-    #print(size(mlpmodel,1))
+    train_df = feats(train_df)
+    dev_df = feats(dev_df)
 
-    #Seperate corpus and dev
-    df = df[shuffle(1:end), :]
-    test_df = df[end-199:end,:]
-    sep = size(df,1) - round(Int,size(df,1)/5 - 200)
-    train_df = df[1:sep,:]
-    dev_df = df[sep+1:end-200,:]
-
-    println("Train-dev seperated.")
     println("Start Training...")
     flush(STDOUT)
 
+    best_acc = 0.0
+    acc1 = 0.0
     for i in 1:epochs
         lval = []
-        lss = oracletrain(mlpmodel, train_df, opts, lval; pdrop=(0.5, 0.8))
+        lss = oracletrain(mlpmodel, train_df, opts; pdrop=(0.3, 0.5))
         trnacc = oracleacc(mlpmodel, train_df; pdrop=(0.0, 0.0))
         acc1 = oracleacc(mlpmodel, dev_df; pdrop=(0.0, 0.0))
-        #=
-        if savemode
-            JLD.save("pos_experiment.jld", "model", model, "optims", opts)
-            println("Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-            i==5 && break
+
+        if acc1 > best_acc
+            JLD.save("experiment_first_best_model_only_word_embeds.jld", "model", mlpmodel, "optims", opts)
+            best_acc = acc1
+            println("Now best model")
         end
-        =#
+
         println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
 	flush(STDOUT)
     end
-    JLD.save("experiment2.jld", "model", mlpmodel, "optims", opts)
+    JLD.save("experiment_first_only_word_embeds.jld", "model", mlpmodel, "optims", opts)
     #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(mlpmodel, test_df)
-    println("test acc $acc2")
+    test_df = load("testData_20180901_only_word_embeds.jld")["data"]
+    test_df = feats(test_df)
 
+    if acc1 < best_acc
+        asd = load("experiment_first_best_model_only_word_embeds.jld")
+        mlpmodel = asd["model"]
+        opts = asd["optims"]
+        acc2, f1_neg, f1_pos = oracleacc(mlpmodel, test_df, test=true)
+    else
+        acc2, f1_neg, f1_pos = oracleacc(mlpmodel, test_df, test=true)
+    end
+
+    println("test acc $acc2")
+    println("Negative class $f1_neg, Positive class $f1_pos")
 end
 
-#=
-alldf = createdf(data,gpufeats=true)
-println("Saving data...")
-save("timesofindia_with_column2.jld", "data", alldf)
-=#
-
+Knet.setseed(42)
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("timesofindia_with_column2.jld")["data"]
+train_df = load("trainData_20180901_only_word_embeds.jld")["data"]
+dev_df = load("devData_20180901_only_word_embeds.jld")["data"]
 
-main!(alldf,epochs=30,gpufeats=true)
+main!(train_df,dev_df,epochs=30,gpufeats=true)

@@ -1,11 +1,16 @@
 using ExcelReaders
 using DataValues
-using Knet, JLD
+using JLD, Knet
 using TextAnalysis
 
-data = readxlsheet("20180613_theIndianExpress_AgreedByAll.xlsx", "Sheet1")
+data = readxlsheet("20180901_TimesOfIndia_RawNewsArticles_AgreedByAll.xlsx", "Sheet1")
+data2 = readxlsheet("20180901_theIndianExpress_AgreedByAll.xlsx", "Sheet1")
+data3 = readxlsheet("20180801_theHindu_AgreedByAll.xlsx", "Sheet1")
+data4 = readxlsheet("20180905_scmp_AgreedByAll.xlsx", "Sheet1")
 
-struct Document
+lmfile = "/scratch/users/omutlu/juliastuff/english_chmodel.jld"
+
+mutable struct Document
     word::Array
     wvec::Array
     fvec::Array
@@ -67,14 +72,14 @@ end
 
 #Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/preprocess.jl
 #Changed it a little
-function wordlstm(fmodel, bmodel, doc::Document)
+function wordlstm(fmodel, bmodel, doc::Document; gpufeats=false)
     # gpu-cpu conversion
-    ftype = typeof(fmodel[1])
+    ftype = (gpufeats ? KnetArray{Float32} : Array{Float32})
 
     # forward lstm
     fvecs = Array{Any}(length(doc.word))
-    wforw, bforw = fmodel[1], fmodel[2]
-    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 350x1
+    wforw, bforw = ftype(fmodel[1]), ftype(fmodel[2])
+    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 300x1
     fvecs[1] = hidden
     for i in 1:length(doc.word)-1
         (hidden, cell) = old_lstm(wforw, bforw, hidden, cell, doc.wvec[i])
@@ -83,7 +88,7 @@ function wordlstm(fmodel, bmodel, doc::Document)
 
     # backward lstm
     bvecs = Array{Any}(length(doc.word))
-    wback, bback = bmodel[1], bmodel[2]
+    wback, bback = ftype(bmodel[1]), ftype(bmodel[2])
     hidden = cell = ftype(Array{Float32}(xavier(350,1)))
     bvecs[end] = hidden
     for i in length(doc.word):-1:2
@@ -97,6 +102,7 @@ end
 #Changed it a little
 
 function fillallvecs!(corpus; gpufeats=false)
+
     fmodel = Array{Any}(2)
     bmodel = Array{Any}(2)
     #Maybe pretrained later
@@ -104,10 +110,19 @@ function fillallvecs!(corpus; gpufeats=false)
     fmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
     bmodel[1] = (gpufeats ? KnetArray{Float32}(xavier(1400,650)) : Array{Float32}(xavier(1400,650)))
     bmodel[2] = (gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1)))
+
+#Omer's language model instead of randomly generating the weights (https://github.com/kirnap)
+#=
+    asd = load("english_chmodel.jld")
+    fmodel = asd["forw"]
+    bmodel = asd["back"]
+    asd = nothing
+    knetgc()
+=#
     println("Getting word embeddings and Generating context...")
     for doc in corpus
         #Create context here
-        fvecs, bvecs = wordlstm(fmodel, bmodel, doc)
+        fvecs, bvecs = wordlstm(fmodel, bmodel, doc, gpufeats=gpufeats)
         f = (gpufeats ? KnetArray{Float32} : Array{Float32})
         map(i->push!(doc.fvec, f(i)), fvecs)
         map(i->push!(doc.bvec, f(i)), bvecs)
@@ -127,6 +142,7 @@ function createcorpus1(data;gpufeats=false)
         words = words[1:end-5]
         embeds = []
         for w in words
+#            push!(embeds, ftype(vcat(getvec(wvec1, w),fill!(Array{Float32}(50,1),0.0))))
             push!(embeds, ftype(getvec(wvec1, w)))
         end
         #doc = WordTokenizers.split_sentences(data[i,3])
@@ -148,7 +164,7 @@ oparams{T<:Number}(::Array{T},otype; o...)=otype(;o...)
 oparams(a::Associative,otype; o...)=Dict(k=>oparams(v,otype;o...) for (k,v) in a)
 oparams(a,otype; o...)=map(x->oparams(x,otype;o...), a)
 
-# xavier initialization taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
+# xavier init taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
 function initx(d...; ftype=Float32, gpufeats=false)
     if gpufeats
         KnetArray{ftype}(xavier(d...))
@@ -157,130 +173,20 @@ function initx(d...; ftype=Float32, gpufeats=false)
     end
 end
 
-#Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-#changed it a little
-function initmodel(inputdim,hiddens,classnumber;gpufeats=false)
-    # initialize MLP
-    mlpmodel = Any[]
-    mlpdims = (inputdim, hiddens..., classnumber)
-    #dims = Any[]
-    for i in 2:length(mlpdims)
-        push!(mlpmodel, initx(mlpdims[i], mlpdims[i-1], gpufeats=gpufeats)) # w
-        push!(mlpmodel, initx(mlpdims[i], 1,gpufeats=gpufeats)) # b
-    end
-    #push!(mlpmodel, dims)
-    return mlpmodel
-end
-
-#Taken from https://github.com/kirnap/learnbyfun/blob/master/JULIA/pos-tagger/model.jl
-function mlp1(w, input)
-    #x = dropout(input, pdrop[1])
-    for i in 1:2:length(w)-2
-        input = relu.(w[i] * input .+ w[i+1]) # To test in linear models
-        #x = w[i] * x .+ w[i+1]
-        #x = dropout(x, pdrop[2])
-    end
-    return w[end-1]*input .+ w[end]
-end
-
-function oracleloss(mlpmodel, ind, df; lval=[], pdrop=(0.0, 0.0))
-
-    scores = mlp1(mlpmodel, df[ind,4])
-    #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
-    #goldind = df[ind,3]
-    #cval = -logprobs[goldind]
-
-    push!(lval, (AutoGrad.getval(cval)))
-    return cval
-end
-
-oraclegrad = grad(oracleloss)
-
-function oracletrain(mlpmodel, df, opts, batchsize, lval=[]; pdrop=nothing)
-    lval = []
-    for ind in 1:size(df,1)
-        ograds = oraclegrad(mlpmodel, ind, df, lval=lval, pdrop=pdrop)
-        update!(mlpmodel, ograds, opts)
-    end
-    avgloss = mean(lval)
-    return avgloss
-end
-
-# Balanced Accuracy
-function oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
-    ntp = 0 #number of true positives
-    ntn = 0 #number of true negatives
-    npos = 0 #positives
-    nneg = 0 #negatives
-    for ind in 1:size(df,1)
-        df[ind,4] = feats(vocab,model[2],df[ind,2])
-        scores = Array(mlp1(model[1], df[ind,4]))
-        (val1,pred) = findmax(scores)
-        if df[ind,3] == 1
-            nneg += 1
-            if pred == 1
-                ntn += 1
-            end
-        else
-            npos += 1
-            if pred == 2
-                ntp += 1
-            end
-        end
-    end
-    return ((ntp / npos) + (ntn / nneg)) / 2
-end
-
-# Normal Accuracy
-#=
-function oracleacc(mlpmodel, df; pdrop=(0.0, 0.0))
-    ncorr = 0
-    for ind in 1:size(df,1)
-        scores = Array(mlp1(mlpmodel, df[ind,4]))
-        (val1,pred) = findmax(scores)
-        if pred == df[ind,3]
-            ncorr += 1
-        end
-    end
-    return ncorr / size(df,1)
-end
-=#
-
-#=
-function feats(vocab, df, wordmodel)
+function feats(df)
     for i in 1:size(df,1)
         doc = df[i,2]
-        total = fill!(similar(doc.fvec[1], 1000, 1),0)
+#        total = fill!(similar(doc.fvec[1], 1000, 1),0)
         for j in 1:length(doc.word)
-            w = vocab[doc.word[j]]
-            if !(w in keys(vocab))
-                vocab[w] = Array{Float32}(xavier(1))[1]
-            end
             # This is the input that mlp is going to get
-            total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* vocab[w])
+            total = vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j])
+            doc.wvec[j] = Array{Float32}(total)
         end
-        df[i,4] = total
+        doc.fvec = Any[]
+        doc.bvec = Any[]
+        df[i,2] = doc
     end
     return df
-end
-=#
-
-function feats(vocab,wordmodel,doc;training=false)
-
-    total = fill!(similar(KnetArray{Float32}(doc.wvec[1]), 950, 1),0)
-    for j in 1:length(doc.word)
-        # This is the input that mlp is going to get
-        w = doc.word[j]
-        if w in keys(vocab)
-            wweight = wordmodel[vocab[w]]
-        else
-            #wweight = wordmodel[1]
-            wweight = 1/length(doc.word)
-        end
-        total = total .+ KnetArray{Float32}(doc.wvec[j]) .* wweight
-    end
-    return total
 end
 
 function createdf(data; gpufeats=false)
@@ -303,31 +209,27 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df,vocab)
-
-    asd = load("experiment_with_vocab_best_model_with_omers_lm.jld")
-    model = asd["model"]
-    opts = asd["optims"]
-
-#    df = feats(vocab, df, model[2])
-#    println("Generated feats")
-#    flush(STDOUT)
-
-    acc1 = oracleacc(model, df, vocab; pdrop=(0.0, 0.0))
-    println("Indianexpress test acc $acc1 ...")
-    flush(STDOUT)
-
-end
-
+Knet.setseed(42)
 #=
-alldf = createdf(data,gpufeats=true)
+toi_df = createdf(data,gpufeats=true) #Timesofindia
+ie_df = createdf(data2,gpufeats=true) #Indianexpress
+th_df = createdf(data3,gpufeats=true) #Thehindu
+toi_df = vcat(toi_df,ie_df)
+toi_df = vcat(toi_df,th_df)
+println(size(toi_df,1))
+
+#Seperate train,dev and test
+toi_df = toi_df[shuffle(1:end), :]
+sep1 = size(toi_df,1) - round(Int,size(toi_df,1)*15/100)
+test_df = toi_df[sep1:end,:]
+sep2 = sep1 - round(Int,size(toi_df,1)/10)
+dev_df = toi_df[sep2:sep1-1,:]
+train_df = toi_df[1:sep2-1,:]
+
 println("Saving data...")
-save("indianexpress_with_column2.jld", "data", alldf)
+save("trainData_20180901.jld", "data", train_df)
+save("devData_20180901.jld", "data", dev_df)
+save("testData_20180901.jld", "data", test_df)
 =#
-
-println("Loading data...")
-flush(STDOUT)
-alldf = load("indianexpress_with_omers_lm.jld")["data"]
-vocab = load("vocab.jld")["vocab"]
-
-main!(alldf,vocab)
+scmp_df = createdf(data4, gpufeats=true)
+save("scmpData_20180905.jld", "data", scmp_df)

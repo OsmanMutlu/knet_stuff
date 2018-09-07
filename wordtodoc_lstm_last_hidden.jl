@@ -183,12 +183,12 @@ function mlp1(w, input)
     return w[end-1]*input .+ w[end]
 end
 
-function oracleloss(model, ind, df; lval=[], pdrop=(0.0, 0.0))
+function oracleloss(model, ind2, ind3; lval=[], pdrop=(0.0, 0.0))
 
-    df[ind,4] = feats(df[ind,2],model[2])
-    scores = mlp1(model[1], df[ind,4])
+    total = feats(ind2,model[2])
+    scores = mlp1(model[1], total)
     #logprobs = logp(scores)
-    cval = nll(scores,[df[ind,3]])
+    cval = nll(scores,[ind3])
     #goldind = df[ind,3]
     #cval = -logprobs[goldind]
 
@@ -201,7 +201,7 @@ oraclegrad = grad(oracleloss)
 function oracletrain(model, df, opts, batchsize, lval=[]; pdrop=nothing)
     lval = []
     for ind in 1:size(df,1)
-        ograds = oraclegrad(model, ind, df, lval=lval, pdrop=pdrop)
+        ograds = oraclegrad(model, df[ind,2], df[ind,3], lval=lval, pdrop=pdrop)
         update!(model, ograds, opts)
     end
     avgloss = mean(lval)
@@ -252,13 +252,12 @@ function feats(doc,wordmodel)
 
     weight = wordmodel[1]
     bias = wordmodel[2]
-    ftype = typeof(doc.fvec[1])
 
-    hidden = cell = ftype(Array{Float32}(xavier(350,1))) # Hiddens are 1000x1
+    hidden = cell = KnetArray{Float32}(xavier(300,1)) # Hiddens are 950x1
 
     for j in 1:length(doc.word)
 
-        (hidden, cell) = old_lstm(weight, bias, hidden, cell, (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j])))
+        (hidden, cell) = old_lstm(weight, bias, hidden, cell, KnetArray{Float32}(doc.wvec[j]))
         #total = total .+ (vcat(doc.bvec[j],doc.wvec[j],doc.fvec[j]) .* 1/length(doc.word))
     end
 
@@ -286,23 +285,24 @@ function createdf(data; gpufeats=false)
 
 end
 
-function main!(df;epochs=30,gpufeats=false)
+function main!(train_df,dev_df;epochs=30,gpufeats=false)
 
-    inputdim = 350
+    inputdim = 300
     hiddens = [2048]
     classnumber = 2
 
     model = Any[]
     push!(model,initmodel(inputdim,hiddens,classnumber,gpufeats=gpufeats))
     wordmodel = Any[]
-    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1350)) : Array{Float32}(xavier(1400,1350))))
-    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1400,1)) : Array{Float32}(xavier(1400,1))))
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1200,600)) : Array{Float32}(xavier(1200,600))))
+    push!(wordmodel,(gpufeats ? KnetArray{Float32}(xavier(1200,1)) : Array{Float32}(xavier(1200,1))))
     push!(model,wordmodel)
     wordmodel = nothing
     opts = oparams(model, Adam; gclip=5.0)
 
     #print(size(mlpmodel,1))
 
+#=
     #Seperate corpus and dev
     df = df[shuffle(1:end), :]
     test_df = df[end-199:end,:]
@@ -313,25 +313,38 @@ function main!(df;epochs=30,gpufeats=false)
     println("Train-dev seperated.")
     println("Start Training...")
     flush(STDOUT)
+=#
 
+    acc1 = 0.0
+    best_acc = 0.0
     for i in 1:epochs
         lval = []
         lss = oracletrain(model, train_df, opts, lval; pdrop=(0.5, 0.8))
         trnacc = oracleacc(model, train_df; pdrop=(0.0, 0.0))
         acc1 = oracleacc(model, dev_df; pdrop=(0.0, 0.0))
-        #=
-        if savemode
-            JLD.save("pos_experiment.jld", "model", model, "optims", opts)
-            println("Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-            i==5 && break
+
+        if acc1 > best_acc
+            JLD.save("experiment_lstm_last_hidden_best_model_only_word_embeds.jld", "model", model, "optims", opts)
+            best_acc = acc1
+            println("Now best model")
         end
-        =#
+
         println("Loss val $lss trn acc $trnacc dev acc $acc1 ...")
 	flush(STDOUT)
     end
-    JLD.save("experiment_lstm_last_hidden1.jld", "model", model, "optims", opts)
-    #println("Final!!! Loss val $lss trn acc $trnacc tst acc $acc1 ...")
-    acc2 = oracleacc(model, test_df)
+    JLD.save("experiment_lstm_last_hidden_only_word_embeds.jld", "model", model, "optims", opts)
+
+    test_df = load("testData_20180901_only_word_embeds.jld")["data"]
+
+    if acc1 < best_acc
+        asd = load("experiment_lstm_last_hidden_best_model_only_word_embeds.jld")
+        model = asd["model"]
+        opts = asd["optims"]
+        acc2 = oracleacc(model, test_df)
+    else
+        acc2 = oracleacc(model, test_df)
+    end
+
     println("test acc $acc2")
 
 end
@@ -345,6 +358,10 @@ save("timesofindia_with_column2.jld", "data", alldf)
 
 println("Loading data...")
 flush(STDOUT)
-alldf = load("timesofindia_with_column2.jld")["data"]
 
-main!(alldf,epochs=30,gpufeats=true)
+train_df = load("trainData_20180901_only_word_embeds.jld")["data"]
+dev_df = load("devData_20180901_only_word_embeds.jld")["data"]
+
+Knet.setseed(42)
+
+main!(train_df,dev_df,epochs=30,gpufeats=true)
